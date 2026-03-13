@@ -10,11 +10,13 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
-SUPPORTED_TENSORS = {"q", "k", "v", "attn_weights"}
+SUPPORTED_TENSORS = {"q", "k", "v", "attn_weights", "q_after_rope", "k_after_rope"}
 TENSOR_TO_MODULE_SUFFIX = {
     "q": "q_proj",
     "k": "k_proj",
     "v": "v_proj",
+    "q_after_rope": "q_norm",
+    "k_after_rope": "k_norm",
 }
 
 
@@ -39,7 +41,7 @@ def parse_args() -> argparse.Namespace:
         type=str,
         required=True,
         choices=sorted(SUPPORTED_TENSORS),
-        help="Tensor to capture: q / k / v / attn_weights.",
+        help="Tensor to capture: q / k / v / q_after_rope / k_after_rope / attn_weights.",
     )
     parser.add_argument("--device", type=str, default="cpu", help="Device, e.g. cpu / cuda / cuda:0.")
     parser.add_argument(
@@ -101,7 +103,7 @@ def set_eager_attention_or_raise(model: Any) -> None:
         )
 
 
-def capture_projection_tensor(
+def capture_module_output_tensor(
     model: Any,
     encoded: dict[str, Any],
     layer_idx: int,
@@ -118,13 +120,14 @@ def capture_projection_tensor(
             raise TypeError(
                 f"Expected Tensor output from {source_module}, but got {type(output).__name__}."
             )
-        # IMPORTANT: We capture the linear projection output of q_proj/k_proj/v_proj.
-        # Whether it strictly equals RoPE-before tensors is still unconfirmed.
+        # IMPORTANT: q/k/v capture projection outputs; q_after_rope/k_after_rope capture fixed
+        # approximate candidates from q_norm/k_norm based on external probe evidence.
+        # q_after_rope/k_after_rope here are NOT proven exact post-RoPE tensors.
         capture_store["tensor"] = output.detach().cpu().clone()
 
     handle = module.register_forward_hook(_hook)
     try:
-        logging.info("Running one forward pass for projection capture...")
+        logging.info("Running one forward pass for module-output capture...")
         run_single_forward(model, encoded)
     finally:
         handle.remove()
@@ -227,16 +230,28 @@ def main() -> None:
     encoded = encode_inputs(tokenizer, args.prompt, args.device)
     source_field: str | None = None
     semantic_info: dict[str, Any] | None = None
-    if tensor_name in {"q", "k", "v"}:
-        captured, source_module = capture_projection_tensor(
+    explanation: str | None = None
+    if tensor_name in {"q", "k", "v", "q_after_rope", "k_after_rope"}:
+        captured, source_module = capture_module_output_tensor(
             model=model,
             encoded=encoded,
             layer_idx=layer_idx,
             tensor_name=tensor_name,
         )
-        tensor_semantics = "projection_output"
-        capture_method = "forward_hook"
-        rope_stage = "uncertain"
+        if tensor_name in {"q", "k", "v"}:
+            tensor_semantics = "projection_output"
+            capture_method = "forward_hook"
+            rope_stage = "uncertain"
+        else:
+            tensor_semantics = "approximate_post_rope_candidate"
+            capture_method = "forward_hook_fixed_candidate_mapping_q_norm_k_norm"
+            rope_stage = "uncertain"
+            explanation = (
+                "Current capture point uses q_norm/k_norm as an approximate candidate because "
+                "remote probe showed q_norm/k_norm are stably present, have plausible shapes, and "
+                "are called after q_proj/k_proj; however, they are not yet strictly proven to be exact "
+                "post-RoPE q/k tensors."
+            )
     elif tensor_name == "attn_weights":
         captured = capture_attn_weights_tensor(
             model=model,
@@ -279,6 +294,8 @@ def main() -> None:
         "capture_method": capture_method,
         "tensor_file": str(tensor_path),
     }
+    if explanation is not None:
+        metadata["explanation"] = explanation
     if semantic_info is not None:
         metadata.update(
             {
