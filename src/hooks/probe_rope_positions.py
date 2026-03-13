@@ -13,7 +13,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 DEFAULT_OUTPUT_JSON = Path("outputs/reports/rope_position_probe.json")
 DEFAULT_OUTPUT_MD = Path("outputs/reports/rope_position_probe.md")
-RELATED_KEYWORDS = ("rope", "rotary", "attn", "attention", "q_proj", "k_proj")
+RELATED_KEYWORDS = ("rope", "rotary", "rotary_emb", "apply_rotary",)
 
 
 @dataclass
